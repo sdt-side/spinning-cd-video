@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""ジャケットの横で半月のCDが回る動画を作る。
+"""回るCD盤面の動画を作る（2レイアウト）。
 
 手続き的な生成です。動画生成モデルは使いません。
 盤面テクスチャを PIL で1フレームずつ回転させ、ffmpeg に流し込んで
 10秒ループ（240フレーム @24fps、時計回りにちょうど1回転）を作ります。
 
+レイアウト:
+  side     … 3:2。左にジャケット、右端に中心を合わせた半月の盤面（既定）
+  halfmoon … 9:16。ジャケット無し。左端の縦中央に中心を置いた半月の盤面だけ
+
 使い方:
   # バランス確認用の静止画
   python3 make_cd_video.py --jacket jacket.jpg --disc disc.png --still balance.png
+  python3 make_cd_video.py --layout halfmoon --disc disc.png --still balance.png
   # 10秒ループ
   python3 make_cd_video.py --jacket jacket.jpg --disc disc.png --loop loop10.mp4
+  python3 make_cd_video.py --layout halfmoon --disc disc.png --loop loop10.mp4
 
 曲のミックスは README の ffmpeg コマンドを参照。
 """
@@ -22,14 +28,17 @@ from PIL import Image
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--jacket", required=True, help="ジャケット画像（完成品）")
+    p.add_argument("--layout", choices=["side", "halfmoon"], default="side")
+    p.add_argument("--jacket", help="ジャケット画像（side レイアウトで必須）")
     p.add_argument("--disc", required=True, help="盤面テクスチャ（正方形、円が内接）")
     p.add_argument("--still", help="バランス確認用の静止画を出力するパス")
     p.add_argument("--loop", help="10秒ループ動画を出力するパス")
-    p.add_argument("--width", type=int, default=1080, help="フレーム幅 (default: 1080)")
-    p.add_argument("--height", type=int, default=720, help="フレーム高さ (default: 720)")
-    p.add_argument("--disc-diameter", type=int, default=640,
-                   help="盤面の直径 px (default: 640)")
+    p.add_argument("--width", type=int, default=0,
+                   help="フレーム幅（0=レイアウト既定：side 1080 / halfmoon 720）")
+    p.add_argument("--height", type=int, default=0,
+                   help="フレーム高さ（0=レイアウト既定：side 720 / halfmoon 1280）")
+    p.add_argument("--disc-diameter", type=int, default=0,
+                   help="盤面の直径 px（0=レイアウト既定：side 640 / halfmoon 高さ×0.89）")
     p.add_argument("--bg", type=int, default=255,
                    help="背景の明るさ 0-255 (default: 255 = 白)")
     p.add_argument("--ccw", action="store_true",
@@ -38,15 +47,10 @@ def parse_args():
     return p.parse_args()
 
 
-def compose_frame(jacket_np, tex_img, angle_deg, fw, fh, d, bg):
-    """1フレームを組む。ジャケットは左に置き、盤面中心はジャケットの
-    右端（= ジャケット幅の位置）に一致させる。"""
-    jacket_w = jacket_np.shape[1]
-    px = jacket_w - d // 2          # 盤面の左端（中心がジャケット右端）
-    py = fh // 2 - d // 2           # 盤面の上端（縦は中央）
+def compose_frame(tex_img, angle_deg, fw, fh, d, bg, px, py, jacket_np=None):
+    """1フレームを組む。(px, py) は盤面の左上。ジャケットがあれば最後に上貼りする。"""
     rot = tex_img.rotate(angle_deg, resample=Image.BICUBIC).resize(
         (d, d), Image.LANCZOS)
-    # 円形マスク（縁を少しだけぼかす）
     yy, xx = np.mgrid[0:d, 0:d]
     rr = np.hypot(xx - d / 2, yy - d / 2) / (d / 2)
     alpha = np.clip((1.0 - rr) / 0.004, 0, 1).astype(np.float32)[..., None]
@@ -56,21 +60,38 @@ def compose_frame(jacket_np, tex_img, angle_deg, fw, fh, d, bg):
     sub = np.asarray(rot).astype(np.float32)[y0 - py:y1 - py, x0 - px:x1 - px]
     a = alpha[y0 - py:y1 - py, x0 - px:x1 - px]
     frame[y0:y1, x0:x1] = frame[y0:y1, x0:x1] * (1 - a) + sub * a
-    # ジャケットを上に貼る（盤面の左半分がジャケットに隠れる）
-    frame[:, :jacket_w] = jacket_np
+    if jacket_np is not None:
+        # ジャケットを上に貼る（盤面の左半分がジャケットに隠れる）
+        frame[:, :jacket_np.shape[1]] = jacket_np
     return np.clip(frame, 0, 255).astype(np.uint8)
 
 
 def main():
     args = parse_args()
-    fw, fh, d = args.width, args.height, args.disc_diameter
-    # ジャケットはフレームの高さに合わせて正方形にリサイズ
-    jacket = Image.open(args.jacket).convert("RGB").resize((fh, fh), Image.LANCZOS)
-    jacket_np = np.asarray(jacket).astype(np.float32)
+    if args.layout == "side":
+        fw = args.width or 1080
+        fh = args.height or 720
+        d = args.disc_diameter or 640
+        if not args.jacket:
+            raise SystemExit("side レイアウトには --jacket が必要です")
+        jacket = Image.open(args.jacket).convert("RGB").resize(
+            (fh, fh), Image.LANCZOS)
+        jacket_np = np.asarray(jacket).astype(np.float32)
+        # 盤面中心はジャケットの右端、縦は中央
+        px = fh - d // 2
+        py = fh // 2 - d // 2
+    else:  # halfmoon
+        fw = args.width or 720
+        fh = args.height or 1280
+        d = args.disc_diameter or round(fh * 0.89)
+        jacket_np = None
+        # 盤面中心は左端（x=0）の縦中央
+        px = -d // 2
+        py = fh // 2 - d // 2
     tex = Image.open(args.disc).convert("RGB")
 
     if args.still:
-        frame = compose_frame(jacket_np, tex, 0.0, fw, fh, d, args.bg)
+        frame = compose_frame(tex, 0.0, fw, fh, d, args.bg, px, py, jacket_np)
         Image.fromarray(frame).save(args.still)
         print(f"still -> {args.still}")
         return
@@ -92,7 +113,7 @@ def main():
                             stderr=subprocess.DEVNULL)
     for f in range(frames):
         angle = sign * 360.0 * f / frames
-        frame = compose_frame(jacket_np, tex, angle, fw, fh, d, args.bg)
+        frame = compose_frame(tex, angle, fw, fh, d, args.bg, px, py, jacket_np)
         proc.stdin.write(frame.tobytes())
     proc.stdin.close()
     proc.wait()
