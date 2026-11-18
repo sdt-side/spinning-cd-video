@@ -1,4 +1,4 @@
-[日本語](README.md) | 한국어
+[日本語](README.md) | [English](README.en.md) | 한국어
 
 # 재킷 + 회전하는 CD 영상 만드는 법
 
